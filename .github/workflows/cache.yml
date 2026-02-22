@@ -15,6 +15,7 @@ jobs:
         with:
           path: ~/.cache
           key: cache-3a9cd64
-
+          
       - name: prime-cache-3a9cd64
-        run: echo Cache hit ${{ steps.cache_step.outputs.cache-hit }}
+        run: |
+          echo "Cache hit: ${{ steps.cache_step.outputs.cache-hit }}"
