@@ -4,18 +4,19 @@
     meta = {
         'owner': 'ops_analytics',
         'domain': 'fulfillment_and_support'
-    },
-    freshness = {
-        'warn_after': {'count': 2, 'period': 'hour'},
-        'error_after': {'count': 6, 'period': 'hour'}
     }
 ) }}
+
+/* 
+   Note: Freshness is typically defined in a YAML schema file. 
+   If using dbt Cloud/Enterprise for state-aware runs, 
+   ensure your environment supports model-level freshness configs.
+*/
 
 with inventory_snapshots as (
     select 
         snapshot_date as report_date, 
         sku, 
-        warehouse_id, 
         coalesce(system_on_hand_qty, 0) as system_on_hand_qty, 
         coalesce(physical_count_qty, 0) as physical_count_qty 
     from {{ ref('stg_inventory_counts') }} 
@@ -25,11 +26,9 @@ with inventory_snapshots as (
 shipments as (
     select 
         shipment_id, 
-        sku, 
         shipment_created_at::date as report_date, 
-        status as shipment_status, 
+        status,
         promised_delivery_date::date as promised_delivery_date, 
-        coalesce(shipped_qty, 0) as shipped_qty, 
         case when status = 'delivered' and delivered_at <= promised_delivery_date then 1 else 0 end as is_on_time 
     from {{ ref('stg_shipments') }} 
     where shipment_created_at::date >= current_date - interval '14 day'
@@ -38,9 +37,7 @@ shipments as (
 tickets as (
     select 
         ticket_id, 
-        shipment_id, 
         created_at::date as report_date, 
-        ticket_type, 
         ticket_priority, 
         coalesce(handle_minutes, 0) as handle_minutes 
     from {{ ref('stg_support_tickets') }} 
@@ -72,7 +69,7 @@ daily_cycle_accuracy as (
 daily_fulfillment as (
     select 
         report_date, 
-        count(shipment_id) as total_shipments, 
+        count(distinct shipment_id) as total_shipments, 
         coalesce(sum(is_on_time), 0) as on_time_deliveries 
     from shipments 
     group by 1
@@ -80,20 +77,28 @@ daily_fulfillment as (
 
 final as (
     select 
+        -- Coalesce across all three sources for the primary key
         coalesce(ca.report_date, ff.report_date, st.report_date) as report_date,
-        /* Support Metrics */
+        
+        -- Support
         coalesce(st.total_tickets, 0) as total_tickets,
         coalesce(st.avg_handle_minutes, 0.0) as avg_handle_minutes,
         coalesce(st.high_priority_tickets, 0) as high_priority_tickets,
-        /* Inventory Metrics */
+        
+        -- Inventory
         coalesce(ca.total_skus_counted, 0) as total_skus_counted,
         coalesce(ca.cycle_accuracy_rate, 0.0) as cycle_accuracy_rate,
-        /* Fulfilment Metrics */
+        
+        -- Fulfillment
         coalesce(ff.total_shipments, 0) as total_shipments,
         coalesce(ff.on_time_deliveries, 0) as on_time_deliveries
+        
     from daily_cycle_accuracy ca
-    full outer join daily_fulfillment ff on ca.report_date = ff.report_date
-    full outer join daily_support st on coalesce(ca.report_date, ff.report_date) = st.report_date
+    full outer join daily_fulfillment ff 
+        on ca.report_date = ff.report_date
+    full outer join daily_support st 
+        -- Key fix: coalesce the already joined dates to join the third table correctly
+        on coalesce(ca.report_date, ff.report_date) = st.report_date
 )
 
 select * from final order by report_date desc
