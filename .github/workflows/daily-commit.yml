@@ -1,0 +1,99 @@
+{{ config(
+    materialized = 'table',
+    tags = ['mart', 'operations', 'support'],
+    meta = {
+        'owner': 'ops_analytics',
+        'domain': 'fulfillment_and_support'
+    },
+    freshness = {
+        'warn_after': {'count': 2, 'period': 'hour'},
+        'error_after': {'count': 6, 'period': 'hour'}
+    }
+) }}
+
+with inventory_snapshots as (
+    select 
+        snapshot_date as report_date, 
+        sku, 
+        warehouse_id, 
+        coalesce(system_on_hand_qty, 0) as system_on_hand_qty, 
+        coalesce(physical_count_qty, 0) as physical_count_qty 
+    from {{ ref('stg_inventory_counts') }} 
+    where snapshot_date >= current_date - interval '14 day'
+), 
+
+shipments as (
+    select 
+        shipment_id, 
+        sku, 
+        shipment_created_at::date as report_date, 
+        status as shipment_status, 
+        promised_delivery_date::date as promised_delivery_date, 
+        coalesce(shipped_qty, 0) as shipped_qty, 
+        case when status = 'delivered' and delivered_at <= promised_delivery_date then 1 else 0 end as is_on_time 
+    from {{ ref('stg_shipments') }} 
+    where shipment_created_at::date >= current_date - interval '14 day'
+), 
+
+tickets as (
+    select 
+        ticket_id, 
+        shipment_id, 
+        created_at::date as report_date, 
+        ticket_type, 
+        ticket_priority, 
+        coalesce(handle_minutes, 0) as handle_minutes 
+    from {{ ref('stg_support_tickets') }} 
+    where created_at::date >= current_date - interval '14 day'
+),
+
+daily_support as (
+    select 
+        report_date, 
+        count(distinct ticket_id) as total_tickets, 
+        avg(handle_minutes) as avg_handle_minutes, 
+        count(distinct case when ticket_priority = 'high' then ticket_id end) as high_priority_tickets 
+    from tickets 
+    group by 1
+),
+
+daily_cycle_accuracy as (
+    select 
+        report_date, 
+        count(distinct sku) as total_skus_counted, 
+        coalesce(
+            1.0 * count(distinct case when system_on_hand_qty = physical_count_qty then sku end) / 
+            nullif(count(distinct sku), 0), 0.0
+        ) as cycle_accuracy_rate 
+    from inventory_snapshots 
+    group by 1
+),
+
+daily_fulfillment as (
+    select 
+        report_date, 
+        count(shipment_id) as total_shipments, 
+        coalesce(sum(is_on_time), 0) as on_time_deliveries 
+    from shipments 
+    group by 1
+),
+
+final as (
+    select 
+        coalesce(ca.report_date, ff.report_date, st.report_date) as report_date,
+        /* Support Metrics */
+        coalesce(st.total_tickets, 0) as total_tickets,
+        coalesce(st.avg_handle_minutes, 0.0) as avg_handle_minutes,
+        coalesce(st.high_priority_tickets, 0) as high_priority_tickets,
+        /* Inventory Metrics */
+        coalesce(ca.total_skus_counted, 0) as total_skus_counted,
+        coalesce(ca.cycle_accuracy_rate, 0.0) as cycle_accuracy_rate,
+        /* Fulfilment Metrics */
+        coalesce(ff.total_shipments, 0) as total_shipments,
+        coalesce(ff.on_time_deliveries, 0) as on_time_deliveries
+    from daily_cycle_accuracy ca
+    full outer join daily_fulfillment ff on ca.report_date = ff.report_date
+    full outer join daily_support st on coalesce(ca.report_date, ff.report_date) = st.report_date
+)
+
+select * from final order by report_date desc
